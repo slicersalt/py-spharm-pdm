@@ -35,6 +35,7 @@ def duck():
 
     return im
 
+
 def test_version():
     assert importlib.metadata.version("py_spharm_pdm") == m.__version__
 

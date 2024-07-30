@@ -118,28 +118,36 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     geo.SetStartVertex(0)
     geo.SetEndVertex(edges.GetNumberOfPoints() - 1)
     geo.Update()
-    short_path = np.array([geo.GetIdList().GetId(idx) for idx in range(geo.GetIdList().GetNumberOfIds())])
+    short_path = np.array(
+        [geo.GetIdList().GetId(idx) for idx in range(geo.GetIdList().GetNumberOfIds())]
+    )
 
     verts = extract_points(edges)
     norms = extract_normals(edges)
 
     values = np.zeros((adjacency.shape[0],))
-    for prv, idx, nxt in np.lib.stride_tricks.sliding_window_view(short_path, 3):
-        I, _, _ = sp.find(adjacency[:, [idx]])
-        for n in I:
-            if n in short_path:
+    for _, idx, nxt in np.lib.stride_tricks.sliding_window_view(short_path, 3):
+        row_idxs, _, _ = sp.find(adjacency[:, [idx]])
+        for row_idx in row_idxs:
+            if row_idx in short_path:
                 # don't alter the path itself
                 continue
 
             # if west
-            if np.dot(norms[idx], np.cross(verts[nxt] - verts[idx], verts[n] - verts[idx])) > 0:
-                values[n] += 2 * np.pi
+            if (
+                np.dot(
+                    norms[idx],
+                    np.cross(verts[nxt] - verts[idx], verts[row_idx] - verts[idx]),
+                )
+                > 0
+            ):
+                values[row_idx] += 2 * np.pi
                 values[idx] -= 2 * np.pi
 
     lon_laplacian_matrix = laplacian.copy()
-    I, _, _ = sp.find(adjacency[:, [0, -1]])
-    for n in I:
-        lon_laplacian_matrix[n, n] -= 1
+    row_idxs, _, _ = sp.find(adjacency[:, [0, -1]])
+    for row_idx in row_idxs:
+        lon_laplacian_matrix[row_idx, row_idx] -= 1
     lon_laplacian_matrix[0, 0] += 2
 
     lon[1:-1] = sp.linalg.spsolve(lon_laplacian_matrix[1:-1, 1:-1], values[1:-1])
@@ -152,7 +160,7 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     pd.AddArray(arr)
 
     arr = numpy_support.numpy_to_vtk(lon)
-    arr.SetName('Longitude')
+    arr.SetName("Longitude")
     pd.AddArray(arr)
 
     return mesh
