@@ -30,7 +30,11 @@ classifiers = [
   "Typing :: Typed",
 ]
 dynamic = ["version"]
-dependencies = []
+dependencies = [
+  "numpy>=1.26", # current Slicer version
+  "scipy>=1.11.3", # requires sparse laplacian support
+  "vtk>=9.2", # current Slicer version
+]
 
 [project.optional-dependencies]
 test = [
