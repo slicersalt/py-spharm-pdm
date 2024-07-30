@@ -1,0 +1,12 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: 2024.04.23
+_src_path: gh:scientific-python/cookie
+backend: setuptools621
+email: David.Allemang@kitware.com
+full_name: Kitware, Inc.
+license: Apache
+org: slicersalt
+project_name: py-spharm-pdm
+project_short_description: Python implementation of SPHARM-PDM
+url: https://github.com/slicersalt/py-spharm-pdm
+vcs: true
