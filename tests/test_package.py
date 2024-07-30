@@ -6,6 +6,7 @@ import pytest
 import vtk
 
 import py_spharm_pdm as m
+from py_spharm_pdm import core
 
 
 @pytest.fixture()
@@ -40,3 +41,6 @@ def test_version():
 
 def test_duck(duck: vtk.vtkPolyData):
     print(duck)
+
+    init = core.initial_parameterization(duck)
+    print(init)

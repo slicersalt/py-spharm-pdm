@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
-import scipy.sparse as sp
 import vtk
-from numpy.typing import ArrayLike
-from scipy.sparse import csgraph
+from scipy import sparse as sp
+from vtkmodules.util import numpy_support
 
 
 def neighbors(data: vtk.vtkPolyData, pt: int) -> set:
@@ -38,16 +37,7 @@ def extract_normals(data: vtk.vtkPolyData) -> np.ndarray:
     return res
 
 
-def build_adjacency_matrix(mesh: vtk.vtkPolyData):
-    edges = vtk.vtkExtractEdges()
-    edges.SetInputData(mesh)
-    edges.UseAllPointsOn()
-
-    edges.Update()
-
-    result: vtk.vtkPolyData = edges.GetOutput()
-    result.BuildLinks()
-
+def build_adjacency_matrix(edges: vtk.vtkPolyData):
     count = edges.GetNumberOfPoints()
     matrix = sp.dok_array((count, count))
     for pt in range(count):
@@ -86,23 +76,31 @@ def build_mesh(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     normals.ConsistencyOn()
 
     normals.Update()
-
     return normals.GetOutput()
+
+
+def build_edges(mesh: vtk.vtkPolyData) -> vtk.vtkPolyData:
+    extract = vtk.vtkExtractEdges()
+    extract.SetInputData(mesh)
+    extract.UseAllPointsOn()
+
+    extract.Update()
+
+    edges: vtk.vtkPolyData = extract.GetOutput()
+    edges.BuildLinks()
+
+    return edges
 
 
 def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     mesh = build_mesh(data)
-    adjacency = build_adjacency_matrix(mesh)
+    edges = build_edges(mesh)
+    adjacency = build_adjacency_matrix(edges)
 
-    lat = solve_latitude(adjacency)
+    # region Latitude problem
+    laplacian = sp.csgraph.laplacian(adjacency).tocsr()
 
-
-def solve_latitude(adjacency: ArrayLike) -> ArrayLike:
-    # assumes the first vertex is the north pole and the last vertex is the south pole.
-
-    laplacian = csgraph.laplacian(adjacency)
-
-    lat = np.zeros((len(adjacency),))
+    lat = np.zeros((adjacency.shape[0],))
     lat[-1] = np.pi
 
     # `[1:-1]` mask avoids the poles; they are the boundary conditions. `values` is `pi` for nodes adjacent to the south
@@ -110,5 +108,51 @@ def solve_latitude(adjacency: ArrayLike) -> ArrayLike:
     values = adjacency[:, [-1]] * lat[-1]
 
     lat[1:-1] = sp.linalg.spsolve(laplacian[1:-1, 1:-1], values[1:-1])
+    # endregion
 
-    return lat
+    # region Longitude problem
+    lon = np.zeros((adjacency.shape[0],))
+
+    geo = vtk.vtkDijkstraGraphGeodesicPath()
+    geo.SetInputData(edges)
+    geo.SetStartVertex(0)
+    geo.SetEndVertex(edges.GetNumberOfPoints() - 1)
+    geo.Update()
+    short_path = np.array([geo.GetIdList().GetId(idx) for idx in range(geo.GetIdList().GetNumberOfIds())])
+
+    verts = extract_points(edges)
+    norms = extract_normals(edges)
+
+    values = np.zeros((adjacency.shape[0],))
+    for prv, idx, nxt in np.lib.stride_tricks.sliding_window_view(short_path, 3):
+        I, _, _ = sp.find(adjacency[:, [idx]])
+        for n in I:
+            if n in short_path:
+                # don't alter the path itself
+                continue
+
+            # if west
+            if np.dot(norms[idx], np.cross(verts[nxt] - verts[idx], verts[n] - verts[idx])) > 0:
+                values[n] += 2 * np.pi
+                values[idx] -= 2 * np.pi
+
+    lon_laplacian_matrix = laplacian.copy()
+    I, _, _ = sp.find(adjacency[:, [0, -1]])
+    for n in I:
+        lon_laplacian_matrix[n, n] -= 1
+    lon_laplacian_matrix[0, 0] += 2
+
+    lon[1:-1] = sp.linalg.spsolve(lon_laplacian_matrix[1:-1, 1:-1], values[1:-1])
+    # endregion
+
+    pd: vtk.vtkPointData = mesh.GetPointData()
+
+    arr = numpy_support.numpy_to_vtk(lat)
+    arr.SetName("Latitude")
+    pd.AddArray(arr)
+
+    arr = numpy_support.numpy_to_vtk(lon)
+    arr.SetName('Longitude')
+    pd.AddArray(arr)
+
+    return mesh
