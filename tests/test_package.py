@@ -40,8 +40,8 @@ def test_version():
     assert importlib.metadata.version("py_spharm_pdm") == m.__version__
 
 
-def test_duck(duck: vtk.vtkPolyData):
-    print(duck)
+def test_duck(duck: vtk.vtkImageData):
+    mesh = core.initial_parameterization(duck)
+    core.refine_parameterization(mesh)
 
-    init = core.initial_parameterization(duck)
-    print(init)
+    # print(init)
