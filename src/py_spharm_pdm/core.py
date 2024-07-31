@@ -174,8 +174,8 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
     # matrix = build_adjacency_matrix(edges)
 
     pd: vtk.vtkPointData = mesh.GetPointData()
-    lat_0 = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Latitude"))
-    lon_0 = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Longitude"))
+    lat = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Latitude"))
+    lon = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Longitude"))
 
     # todo instead of EDGES, maybe get tuples from sparse adjacency matrix?
     #  maybe some multiplication by the adjacency matrix?
@@ -188,7 +188,17 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
         ids: vtk.vtkIdList = cell.GetPointIds()
         cells[idx] = [ids.GetId(k) for k in range(ids.GetNumberOfIds())]
 
+    sphere = np.array(
+        [
+            np.sin(lat) * np.cos(lon),
+            np.sin(lat) * np.sin(lon),
+            np.cos(lat),
+        ]
+    ).T
+
     ideal_cell_area = 4 * np.pi / mesh.GetNumberOfCells()
+
+    # todo make a class, not closures.
 
     # todo let `x` be lat/lon, then there is no need for norm constraint. would need to recompute cartesian coordinates
     #  in goal func and area constraint, so better merge `goal_func` and `gradient` together with `jac=True`.
@@ -198,17 +208,17 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
 
     result = scipy.optimize.minimize(
         fun=refiner.goal_func,
-        x0=np.ravel([lat_0, lon_0]).ravel(),
-        jac=True,
+        x0=sphere.ravel(),
+        jac=refiner.gradient,
         hess="2-point",
         constraints=[
-            # NonlinearConstraint(
-            #     refiner.norms,
-            #     1,
-            #     1,
-            #     jac=refiner.norms_jac,
-            #     hess="2-point",
-            # ),
+            NonlinearConstraint(
+                refiner.norms,
+                1,
+                1,
+                jac=refiner.norms_jac,
+                hess="2-point",
+            ),
             NonlinearConstraint(
                 refiner.areas,
                 ideal_cell_area,
@@ -224,11 +234,10 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
             "sparse_jacobian": True,
         },
     )
-    lat_f, lon_f = result.x.reshape(2, -1)
-    d_lat = lat_f - lat_0
-    d_lon = lon_f - lon_0
-    # print(d_lat.mean(), d_lon.mean())
-    _ = d_lat, d_lon
+    final = result.x.reshape(sphere.shape)
+
+    _ = final
+    # todo reconstruct lat, lon from final; apply to the mesh.
 
 
 class Refiner:
@@ -247,102 +256,65 @@ class Refiner:
     def __init__(self, cells: np.typing.NDArray):
         self.cells = cells
 
-    def _points(self, x):
-        lat, lon = x.reshape(2, -1)
-        return np.array(
-            [
-                np.sin(lat) * np.cos(lon),
-                np.sin(lat) * np.sin(lon),
-                np.cos(lat),
-            ]
-        ).T
-
     def goal_func(self, x) -> float:
         """See EqualAreaParametricMeshNewtonIterator::goal_func."""
         # for vertex in vertices:
         #     for neighbor in neighbors(vertex):
         #         goal += 1 - dot(vertex, neighbor)
 
-        import torch
+        points = x.reshape(-1, 3)
 
-        x = torch.tensor(x, requires_grad=True)
+        prod = np.prod(points[self.cells[:, self.EDGE_INDICES]], axis=-2).reshape(-1, 3)
 
-        lat, lon = x.reshape(2, -1)
+        return (len(prod) - prod.sum()) / 2
 
-        points = torch.stack(
-            [
-                torch.sin(lat) * torch.cos(lon),
-                torch.sin(lat) * torch.sin(lon),
-                torch.cos(lat),
-            ]
-        ).T
-
-        prod = torch.prod(points[self.cells[:, self.EDGE_INDICES]], axis=-2).reshape(
-            -1, 3
-        )
-        goal = (len(prod) - prod.sum()) / 2
-
-        goal.backward()
-        return goal.detach(), x.grad.detach()
-
-        # # prod.backward()
+    def gradient(self, x) -> np.ndarray:
+        """See EqualAreaParametricMeshNewtonIterator::calc_gradient."""
+        # for vertex in vertices:
+        #     nbsum = [0, 0, 0]
         #
-        # return (len(prod) - prod.sum()) / 2, x.grad
+        #     for neighbor in neighbors(vertex):
+        #         nbsum += neighbor
+        #
+        #     gradient[vertex] = dot(vertex, nbsum) * vertex - nbsum
 
-    # def gradient(self, x) -> np.ndarray:
-    #     """See EqualAreaParametricMeshNewtonIterator::calc_gradient."""
-    #     # for vertex in vertices:
-    #     #     nbsum = [0, 0, 0]
-    #     #
-    #     #     for neighbor in neighbors(vertex):
-    #     #         nbsum += neighbor
-    #     #
-    #     #     gradient[vertex] = dot(vertex, nbsum) * vertex - nbsum
-    #
-    #     lat, lon = x.reshape(2, -1)
-    #     points = np.array(
-    #         [
-    #             np.sin(lat) * np.cos(lon),
-    #             np.sin(lat) * np.sin(lon),
-    #             np.cos(lat),
-    #             ]
-    #     ).T
-    #
-    #     nbsum = np.zeros_like(points)
-    #     for u, v in self.EDGE_INDICES:
-    #         nbsum[self.cells[:, u]] += points[self.cells[:, v]]
-    #         nbsum[self.cells[:, v]] += points[self.cells[:, u]]
-    #
-    #     dot = (nbsum * points).sum(-1)[:, None]
-    #     grad = dot * points - nbsum
-    #
-    #     return grad.ravel()
+        points = x.reshape(-1, 3)
+
+        nbsum = np.zeros_like(points)
+        for u, v in self.EDGE_INDICES:
+            nbsum[self.cells[:, u]] += points[self.cells[:, v]]
+            nbsum[self.cells[:, v]] += points[self.cells[:, u]]
+
+        dot = (nbsum * points).sum(-1)[:, None]
+        grad = dot * points - nbsum
+
+        return grad.ravel()
 
     def hessian(self, _):
         """To replace 2-point Hessian in minimize() and reduce gradient count."""
         raise NotImplementedError
 
-    # def norms(self, x) -> np.ndarray:
-    #     """To constrain norm of each vectors to 1."""
-    #     points = x.reshape(-1, 3)
-    #
-    #     return np.linalg.norm(points, axis=1)
-    #
-    # def norms_jac(self, x) -> sp.dok_array:
-    #     """To constrain norm of each vector to 1."""
-    #     # Jacobian at any point is normal to the sphere at that point.
-    #
-    #     points = x.reshape(-1, 3)
-    #     norm = np.linalg.norm(points, axis=1)
-    #     normalized = points / norm[:, None]
-    #
-    #     idxs = np.arange(len(points))
-    #
-    #     res = sp.dok_array((len(points), len(x)))
-    #     for k in range(points.shape[1]):
-    #         res[idxs, points.shape[1] * idxs + k] = normalized[:, k]
-    #
-    #     return res
+    def norms(self, x) -> np.ndarray:
+        """To constrain norm of each vectors to 1."""
+        points = x.reshape(-1, 3)
+
+        return np.linalg.norm(points, axis=1)
+
+    def norms_jac(self, x) -> sp.dok_array:
+        """To constrain norm of each vector to 1."""
+        # Jacobian at any point is normal to the sphere at that point.
+
+        points = x.reshape(-1, 3)
+        norm = np.linalg.norm(points, axis=1)
+        normalized = points / norm[:, None]
+
+        idxs = np.arange(len(points))
+
+        res = sp.dok_array((len(points), len(x)))
+        for k in range(points.shape[1]):
+            res[idxs, points.shape[1] * idxs + k] = normalized[:, k]
+
+        return res
 
     def norms_hess(self, _):
         """To replace 2-point Hessian in NonlinearConstraint and reduce norms_jac count."""
@@ -350,7 +322,7 @@ class Refiner:
 
     def areas(self, x) -> np.ndarray:
         """See EqualAreaParametricMeshNewtonIterator::spher_area4."""
-        points = self._points(x)
+        points = x.reshape(-1, 3)
 
         corners = points[self.cells, :]
 
