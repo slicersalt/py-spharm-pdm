@@ -209,7 +209,7 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
     result = scipy.optimize.minimize(
         fun=refiner.goal_func,
         x0=sphere.ravel(),
-        jac=refiner.gradient,
+        jac=True,
         hess="2-point",
         constraints=[
             NonlinearConstraint(
@@ -223,8 +223,8 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
                 refiner.areas,
                 ideal_cell_area,
                 ideal_cell_area,
-                # jac=refiner.areas_jac,
-                # hess='2-point',
+                jac=refiner.areas_jac,
+                hess="2-point",
             ),
         ],
         method="trust-constr",
@@ -262,68 +262,53 @@ class Refiner:
         #     for neighbor in neighbors(vertex):
         #         goal += 1 - dot(vertex, neighbor)
 
+        import torch
+
+        x = torch.tensor(x, requires_grad=True)
         points = x.reshape(-1, 3)
-
-        prod = np.prod(points[self.cells[:, self.EDGE_INDICES]], axis=-2).reshape(-1, 3)
-
-        return (len(prod) - prod.sum()) / 2
-
-    def gradient(self, x) -> np.ndarray:
-        """See EqualAreaParametricMeshNewtonIterator::calc_gradient."""
-        # for vertex in vertices:
-        #     nbsum = [0, 0, 0]
-        #
-        #     for neighbor in neighbors(vertex):
-        #         nbsum += neighbor
-        #
-        #     gradient[vertex] = dot(vertex, nbsum) * vertex - nbsum
-
-        points = x.reshape(-1, 3)
-
-        nbsum = np.zeros_like(points)
-        for u, v in self.EDGE_INDICES:
-            nbsum[self.cells[:, u]] += points[self.cells[:, v]]
-            nbsum[self.cells[:, v]] += points[self.cells[:, u]]
-
-        dot = (nbsum * points).sum(-1)[:, None]
-        grad = dot * points - nbsum
-
-        return grad.ravel()
+        prod = torch.prod(points[self.cells[:, self.EDGE_INDICES]], axis=-2).reshape(
+            -1, 3
+        )
+        goal = (len(prod) - prod.sum()) / 2
+        goal.backward()
+        return goal.detach(), x.grad.detach()
 
     def hessian(self, _):
         """To replace 2-point Hessian in minimize() and reduce gradient count."""
         raise NotImplementedError
 
+    def torch_norms(self, x):
+        import torch
+
+        return torch.linalg.norm(x.reshape(-1, 3), axis=1)
+
     def norms(self, x) -> np.ndarray:
         """To constrain norm of each vectors to 1."""
-        points = x.reshape(-1, 3)
+        import torch
 
-        return np.linalg.norm(points, axis=1)
+        x = torch.tensor(x)
+        return self.torch_norms(x).detach()
 
     def norms_jac(self, x) -> sp.dok_array:
         """To constrain norm of each vector to 1."""
         # Jacobian at any point is normal to the sphere at that point.
 
+        import torch
+
+        x = torch.tensor(x, requires_grad=True)
+        (jac,) = torch.autograd.functional.jacobian(self.torch_norms, (x,))
+        return jac.detach()
+
+    # def norms_hess(self, x, v):
+    #     """To replace 2-point Hessian in NonlinearConstraint and reduce norms_jac count."""
+    #     # since norms is technically vector-valued function, not sure the hessian can really be computed here.
+    #     # the hessian tensor of a vector-valued function could in theory be computed, but not easily with torch.
+    #     raise NotImplemented
+
+    def torch_areas(self, x):
+        import torch
+
         points = x.reshape(-1, 3)
-        norm = np.linalg.norm(points, axis=1)
-        normalized = points / norm[:, None]
-
-        idxs = np.arange(len(points))
-
-        res = sp.dok_array((len(points), len(x)))
-        for k in range(points.shape[1]):
-            res[idxs, points.shape[1] * idxs + k] = normalized[:, k]
-
-        return res
-
-    def norms_hess(self, _):
-        """To replace 2-point Hessian in NonlinearConstraint and reduce norms_jac count."""
-        raise NotImplementedError
-
-    def areas(self, x) -> np.ndarray:
-        """See EqualAreaParametricMeshNewtonIterator::spher_area4."""
-        points = x.reshape(-1, 3)
-
         corners = points[self.cells, :]
 
         diag_a = corners[:, self.DIAG_A_INDICES]
@@ -332,21 +317,32 @@ class Refiner:
             diag_b * corners
         ).sum(-1)
 
-        spats = np.linalg.det(corners[:, self.ANGLE_DET_INDICES])
+        spats = torch.linalg.det(corners[:, self.ANGLE_DET_INDICES])
+        areas = -torch.arctan2(dots, spats).sum(dim=-1)
+        return torch.fmod(areas + 8.5 * torch.pi, torch.pi) - 0.5 * torch.pi
 
-        areas = -np.arctan2(dots, spats).sum(-1)
-        areas = np.fmod(areas + 8.5 * np.pi, np.pi) - 0.5 * np.pi
+    def areas(self, x) -> np.ndarray:
+        """See EqualAreaParametricMeshNewtonIterator::spher_area4."""
+        import torch
 
-        return areas  # noqa: RET504
+        x = torch.tensor(x)
+        return self.torch_areas(x)
 
-    def areas_jac(self, _) -> np.ndarray:
+    def areas_jac(self, x) -> np.ndarray:
         """
         To allow sparse Jacobian and 2-point Hessian in NonlinearConstraint.
 
         EqualAreaParametricMeshNewtonIterator must compute it somehow...
         """
-        raise NotImplementedError
 
-    def areas_hess(self, _) -> np.ndarray:
-        """To replace 2-point Hessian in NonlinearConstraint and reduce areas_jac count."""
-        raise NotImplementedError
+        import torch
+
+        x = torch.tensor(x, requires_grad=True)
+        (jac,) = torch.autograd.functional.jacobian(self.torch_areas, (x,))
+        return jac.detach()
+
+    # def areas_hess(self, x, v) -> np.ndarray:
+    #     """To replace 2-point Hessian in NonlinearConstraint and reduce areas_jac count."""
+    #     # since areas is technically vector-valued function, not sure the hessian can really be computed here.
+    #     # the hessian tensor of a vector-valued function could in theory be computed, but not easily with torch.
+    #     raise NotImplemented
