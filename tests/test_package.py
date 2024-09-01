@@ -9,8 +9,7 @@ import py_spharm_pdm as m
 from py_spharm_pdm import core
 
 
-@pytest.fixture()
-def duck():
+def make_duck():
     SET = [
         (0, 0, 0),
         (0, 0, 1),
@@ -36,11 +35,16 @@ def duck():
     return im
 
 
+@pytest.fixture()
+def duck() -> vtk.vtkImageData:
+    return make_duck()
+
+
 def test_version():
     assert importlib.metadata.version("py_spharm_pdm") == m.__version__
 
 
-def test_duck(duck: vtk.vtkPolyData):
+def test_duck(duck: vtk.vtkImageData):
     print(duck)
 
     init = core.initial_parameterization(duck)

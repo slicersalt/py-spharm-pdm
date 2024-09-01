@@ -94,7 +94,9 @@ def build_edges(mesh: vtk.vtkPolyData) -> vtk.vtkPolyData:
     return edges
 
 
-def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
+def initial_parameterization(
+    data: vtk.vtkImageData,
+) -> vtk.vtkPolyData:
     mesh = build_mesh(data)
     edges = build_edges(mesh)
     adjacency = build_adjacency_matrix(edges)
@@ -169,7 +171,10 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     return mesh
 
 
-def refine_parameterization(mesh: vtk.vtkPolyData):
+def refine_parameterization(
+    mesh: vtk.vtkPolyData,
+    maxiter: int = 1000,
+):
     # edges = build_edges(mesh)
     # matrix = build_adjacency_matrix(edges)
 
@@ -182,7 +187,7 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
 
     # cd: vtk.vtkCellData = mesh.GetCellData()
 
-    cells = np.zeros((mesh.GetNumberOfCells(), 4), dtype="i")
+    cells = np.zeros((mesh.GetNumberOfCells(), 3), dtype="i")
     for idx in range(mesh.GetNumberOfCells()):
         cell: vtk.vtkCell = mesh.GetCell(idx)
         ids: vtk.vtkIdList = cell.GetPointIds()
@@ -198,17 +203,7 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
 
     ideal_cell_area = 4 * np.pi / mesh.GetNumberOfCells()
 
-    edge_indices = [[0, 1], [1, 2], [2, 3], [3, 0]]
-
-    angle_det_indices = [
-        [3, 0, 1],
-        [0, 1, 2],
-        [1, 2, 3],
-        [2, 3, 0],
-    ]
-
-    diag_a_indices = [1, 0, 1, 0]
-    diag_b_indices = [3, 2, 3, 2]
+    edge_indices = [[0, 1], [1, 2], [2, 0]]
 
     # todo make a class, not closures.
 
@@ -286,15 +281,18 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
 
         corners = points[cells, :]
 
-        diag_a = corners[:, diag_a_indices]
-        diag_b = corners[:, diag_b_indices]
-        dots = (diag_a * diag_b).sum(-1) - (diag_a * corners).sum(-1) * (
-            diag_b * corners
-        ).sum(-1)
+        areas = np.linalg.det(corners)
 
-        spats = np.linalg.det(corners[:, angle_det_indices])
+        # diag_a = corners[:, diag_a_indices]
+        # diag_b = corners[:, diag_b_indices]
+        # dots = (diag_a * diag_b).sum(-1) - (diag_a * corners).sum(-1) * (
+        #     diag_b * corners
+        # ).sum(-1)
 
-        areas = -np.arctan2(dots, spats).sum(-1)
+        # spats = np.linalg.det(corners[:, angle_det_indices])
+
+        # areas = -np.arctan2(dots, spats).sum(-1)
+
         areas = np.fmod(areas + 8.5 * np.pi, np.pi) - 0.5 * np.pi
 
         return areas  # noqa: RET504
@@ -335,11 +333,37 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
         method="trust-constr",
         options={
             "xtol": 1e-3,
-            "verbose": 2,
+            # "verbose": 2,
             "sparse_jacobian": True,
+            "maxiter": maxiter,
         },
     )
-    final = result.x.reshape(sphere.shape)
 
-    _ = final
-    # todo reconstruct lat, lon from final; apply to the mesh.
+    sphere_f = result.x.reshape(sphere.shape).T
+    lat_f = np.arccos(sphere_f[2])
+    lon_f = np.atan2(sphere_f[1], sphere_f[0])
+
+    arr = numpy_support.numpy_to_vtk(lat)
+    arr.SetName("Latitude_0")
+    pd.AddArray(arr)
+
+    arr = numpy_support.numpy_to_vtk(lon)
+    arr.SetName("Longitude_0")
+    pd.AddArray(arr)
+
+    arr = numpy_support.numpy_to_vtk(lat_f)
+    arr.SetName("Latitude")
+    pd.AddArray(arr)
+
+    arr = numpy_support.numpy_to_vtk(lon_f)
+    arr.SetName("Longitude")
+    pd.AddArray(arr)
+
+    return result
+
+
+def fit_spharms(mesh: vtk.vtkPolyData):
+    pd: vtk.vtkPointData = mesh.GetPointData()
+
+    lat = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Latitude"))
+    lon = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Longitude"))
