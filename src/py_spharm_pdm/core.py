@@ -6,6 +6,8 @@ import vtk
 from scipy import sparse as sp
 from scipy.optimize import NonlinearConstraint
 from vtkmodules.util import numpy_support
+from vtkmodules.vtkCommonDataModel import vtkPolyData
+from vtkmodules.vtkFiltersHybrid import vtkPolyDataSilhouette
 
 
 def neighbors(data: vtk.vtkPolyData, pt: int) -> set:
@@ -360,6 +362,106 @@ def refine_parameterization(
     pd.AddArray(arr)
 
     return result
+
+
+def torch_refine_parameterization(
+        mesh: vtkPolyData,
+        maxiter=50,
+):
+    """Projected Gradient Descent"""
+    import torch
+
+    pd: vtk.vtkPointData = mesh.GetPointData()
+    lat = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Latitude"))
+    lon = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Longitude"))
+
+    # todo instead of EDGES, maybe get tuples from sparse adjacency matrix?
+    #  maybe some multiplication by the adjacency matrix?
+
+    # cd: vtk.vtkCellData = mesh.GetCellData()
+
+    AREA_WEIGHT = 1
+    ANGLE_WEIGHT = 0
+
+    ideal_cell_area = 4 * torch.pi / mesh.GetNumberOfCells()
+
+    cells = np.zeros((mesh.GetNumberOfCells(), 3), dtype="i")
+    for idx in range(mesh.GetNumberOfCells()):
+        cell: vtk.vtkCell = mesh.GetCell(idx)
+        ids: vtk.vtkIdList = cell.GetPointIds()
+        cells[idx] = [ids.GetId(k) for k in range(ids.GetNumberOfIds())]
+
+    sphere = torch.tensor(np.array([
+        np.sin(lat) * np.cos(lon),
+        np.sin(lat) * np.sin(lon),
+        np.cos(lat),
+    ]), requires_grad=True)
+
+    optimizer = torch.optim.Adam([sphere], lr=1e-1)
+    for i in range(maxiter):
+        optimizer.zero_grad()
+
+        corners = sphere.T[cells, :]
+        areas = torch.linalg.det(corners)
+        area_error = torch.abs(areas - ideal_cell_area)
+
+        # total_area_error = torch.sum(area_error)  # todo is there a better metric for this?
+        total_area_error = area_error.norm()
+
+        l0 = corners[:, 2] - corners[:, 1]
+        l0 = l0 / l0.norm(dim=1)[:, None]
+        l1 = corners[:, 2] - corners[:, 0]
+        l1 = l1 / l1.norm(dim=1)[:, None]
+        l2 = corners[:, 1] - corners[:, 0]
+        l2 = l2 / l2.norm(dim=1)[:, None]
+
+        dots = torch.stack([
+            l1 * l2,
+            -l2 * l0,
+            l0 * l1,
+        ])
+        angle = torch.acos(dots)
+
+        angle_error = torch.abs(angle - torch.pi / 3)
+        total_angle_error = angle_error.norm()
+
+        metric = total_area_error * AREA_WEIGHT + total_angle_error * ANGLE_WEIGHT
+
+        metric.backward()
+
+        # print(i, '|||', *(f'{v:0.1f}' for v in area_error), '|||', total_area_error.item())
+        print(i, '|||', metric.item())
+
+        optimizer.step()
+
+        with torch.no_grad():
+            # enforce sphere constraint
+            sphere /= sphere.norm(dim=0)
+
+            # project gradients into tangent space
+            sphere.grad -= sphere * (sphere * sphere.grad).sum(dim=0)
+
+    sphere_f = sphere.detach().numpy()
+    print(sphere_f[2])
+
+    lat_f = np.arccos(sphere_f[2])
+    lon_f = np.atan2(sphere_f[1], sphere_f[0])
+
+    arr = numpy_support.numpy_to_vtk(lat)
+    arr.SetName("Latitude_0")
+    pd.AddArray(arr)
+
+    arr = numpy_support.numpy_to_vtk(lon)
+    arr.SetName("Longitude_0")
+    pd.AddArray(arr)
+
+    arr = numpy_support.numpy_to_vtk(lat_f)
+    arr.SetName("Latitude")
+    pd.AddArray(arr)
+
+    arr = numpy_support.numpy_to_vtk(lon_f)
+    arr.SetName("Longitude")
+    pd.AddArray(arr)
 
 
 def fit_spharms(mesh: vtk.vtkPolyData):
