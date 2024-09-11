@@ -39,14 +39,14 @@ def extract_normals(data: vtk.vtkPolyData) -> np.ndarray:
     return res
 
 
-def build_adjacency_matrix(edges: vtk.vtkPolyData):
+def build_adjacency_matrix(edges: vtk.vtkPolyData) -> sp.dok_array:
     count = edges.GetNumberOfPoints()
     matrix = sp.dok_array((count, count))
     for pt in range(count):
         for nb in neighbors(edges, pt):
             matrix[pt, nb] = 1
 
-    return matrix.tocsr()
+    return matrix
 
 
 def build_mesh(data: vtk.vtkImageData) -> vtk.vtkPolyData:
@@ -64,17 +64,11 @@ def build_mesh(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     net.SetSmoothing(False)
     net.SetOutputStyleToBoundary()
 
-    clean = vtk.vtkCleanPolyData()
-    clean.SetInputConnection(net.GetOutputPort())
-    clean.PointMergingOn()
-
     normals = vtk.vtkPolyDataNormals()
-    normals.SetInputConnection(clean.GetOutputPort())
+    normals.SetInputConnection(net.GetOutputPort())
     normals.ComputeCellNormalsOff()
     normals.ComputePointNormalsOn()
     normals.SplittingOff()
-    normals.AutoOrientNormalsOn()
-    normals.FlipNormalsOff()
     normals.ConsistencyOn()
 
     normals.Update()
@@ -97,22 +91,39 @@ def build_edges(mesh: vtk.vtkPolyData) -> vtk.vtkPolyData:
 def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     mesh = build_mesh(data)
     edges = build_edges(mesh)
-    adjacency = build_adjacency_matrix(edges)
+    adjacency: sp.csr_array = build_adjacency_matrix(edges).tocsr()
+
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetInputData(edges)
+    writer.SetFileName("debug/pyedges.vtk")
+    writer.Update()
+
+    NORTH = 0
+    SOUTH = -1
 
     # region Latitude problem
-    laplacian = sp.csgraph.laplacian(adjacency).tocsr()
+    lat = np.zeros(adjacency.shape[0])
+    # set all neighbors of south pole to PI
+    lat[adjacency[:, [SOUTH]].todense().flatten().astype(bool)] = np.pi
 
-    lat = np.zeros((adjacency.shape[0],))
-    lat[-1] = np.pi
+    A: sp.csr_array = sp.csgraph.laplacian(adjacency).tocsr()[1:-1, 1:-1]
+    b = lat[1:-1]
 
-    # `[1:-1]` mask avoids the poles; they are the boundary conditions. `values` is `pi` for nodes adjacent to the south
-    # pole and 0 elsewhere. Be careful to keep `values` sparse.
-    values = adjacency[:, [-1]] * lat[-1]
+    x = sp.linalg.spsolve(A, b)
+    lat[NORTH] = 0
+    lat[SOUTH] = np.pi
+    lat[1:-1] = x
 
-    lat[1:-1] = sp.linalg.spsolve(laplacian[1:-1, 1:-1], values[1:-1])
+    arr = numpy_support.numpy_to_vtk(lat)
+    arr.SetName("Latitude")
+    mesh.GetPointData().AddArray(arr)
     # endregion
 
     # region Longitude problem
+    A: sp.csr_array = sp.csgraph.laplacian(adjacency[1:-1, 1:-1]).tocsr()
+    # Arbitrarily increase a diagonal element to make the matrix non-singular.
+    A[0, 0] += 2.0
+
     lon = np.zeros((adjacency.shape[0],))
 
     geo = vtk.vtkDijkstraGraphGeodesicPath()
@@ -147,24 +158,15 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
                 values[row_idx] += 2 * np.pi
                 values[idx] -= 2 * np.pi
 
-    lon_laplacian_matrix = laplacian.copy()
-    row_idxs, _, _ = sp.find(adjacency[:, [0, -1]])
-    for row_idx in row_idxs:
-        lon_laplacian_matrix[row_idx, row_idx] -= 1
-    lon_laplacian_matrix[0, 0] += 2
+    b = values[1:-1]
 
-    lon[1:-1] = sp.linalg.spsolve(lon_laplacian_matrix[1:-1, 1:-1], values[1:-1])
-    # endregion
-
-    pd: vtk.vtkPointData = mesh.GetPointData()
-
-    arr = numpy_support.numpy_to_vtk(lat)
-    arr.SetName("Latitude")
-    pd.AddArray(arr)
+    x = sp.linalg.spsolve(A, b)
+    lon[1:-1] = x
 
     arr = numpy_support.numpy_to_vtk(lon)
     arr.SetName("Longitude")
-    pd.AddArray(arr)
+    mesh.GetPointData().AddArray(arr)
+    # endregion
 
     return mesh
 
