@@ -93,10 +93,10 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     edges = build_edges(mesh)
     adjacency: sp.csr_array = build_adjacency_matrix(edges).tocsr()
 
-    writer = vtk.vtkPolyDataWriter()
-    writer.SetInputData(edges)
-    writer.SetFileName("debug/pyedges.vtk")
-    writer.Update()
+    # writer = vtk.vtkPolyDataWriter()
+    # writer.SetInputData(edges)
+    # writer.SetFileName("debug/pyedges.vtk")
+    # writer.Update()
 
     NORTH = 0
     SOUTH = -1
@@ -121,6 +121,12 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
 
     # region Longitude problem
     A: sp.csr_array = sp.csgraph.laplacian(adjacency[1:-1, 1:-1]).tocsr()
+
+    # north_neighbors = adjacency[[NORTH], 1:-1].todense().flatten()
+    # A[north_neighbors, north_neighbors] -= 1
+    # south_neighbors = adjacency[[SOUTH], 1:-1].todense().flatten()
+    # A[south_neighbors, south_neighbors] -= 1
+
     # Arbitrarily increase a diagonal element to make the matrix non-singular.
     A[0, 0] += 2.0
 
@@ -128,18 +134,22 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
 
     geo = vtk.vtkDijkstraGraphGeodesicPath()
     geo.SetInputData(edges)
-    geo.SetStartVertex(0)
-    geo.SetEndVertex(edges.GetNumberOfPoints() - 1)
+    geo.SetStartVertex(0)  # NORTH
+    geo.SetEndVertex(edges.GetNumberOfPoints() - 1)  # SOUTH
     geo.Update()
     short_path = np.array(
         [geo.GetIdList().GetId(idx) for idx in range(geo.GetIdList().GetNumberOfIds())]
     )
+    print(short_path)
 
     verts = extract_points(edges)
     norms = extract_normals(edges)
 
+    # todo this is where the bug is. this does not correctly set the rhs for the longitude problem
+    # refer to EqualAreaParametricMeshNewtonIterator::set_longi_rhs
     values = np.zeros((adjacency.shape[0],))
     for _, idx, nxt in np.lib.stride_tricks.sliding_window_view(short_path, 3):
+        print(idx)
         row_idxs, _, _ = sp.find(adjacency[:, [idx]])
         for row_idx in row_idxs:
             if row_idx in short_path:
@@ -155,10 +165,11 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
                 )
                 > 0
             ):
-                values[row_idx] += 2 * np.pi
-                values[idx] -= 2 * np.pi
+                values[row_idx] -= 2 * np.pi
+                values[idx] += 2 * np.pi
 
     b = values[1:-1]
+    print(*[f'{e:> 2.2f}' for e in b])
 
     x = sp.linalg.spsolve(A, b)
     lon[1:-1] = x
