@@ -99,7 +99,7 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     # writer.Update()
 
     NORTH = 0
-    SOUTH = -1
+    SOUTH = edges.GetNumberOfPoints() - 1
 
     # region Latitude problem
     lat = np.zeros(adjacency.shape[0])
@@ -122,25 +122,10 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     # region Longitude problem
     A: sp.csr_array = sp.csgraph.laplacian(adjacency[1:-1, 1:-1]).tocsr()
 
-    # north_neighbors = adjacency[[NORTH], 1:-1].todense().flatten()
-    # A[north_neighbors, north_neighbors] -= 1
-    # south_neighbors = adjacency[[SOUTH], 1:-1].todense().flatten()
-    # A[south_neighbors, south_neighbors] -= 1
-
     # Arbitrarily increase a diagonal element to make the matrix non-singular.
     A[0, 0] += 2.0
 
     lon = np.zeros((adjacency.shape[0],))
-
-    geo = vtk.vtkDijkstraGraphGeodesicPath()
-    geo.SetInputData(edges)
-    geo.SetStartVertex(0)  # NORTH
-    geo.SetEndVertex(edges.GetNumberOfPoints() - 1)  # SOUTH
-    geo.Update()
-    short_path = np.array(
-        [geo.GetIdList().GetId(idx) for idx in range(geo.GetIdList().GetNumberOfIds())]
-    )
-    print(short_path)
 
     verts = extract_points(edges)
     norms = extract_normals(edges)
@@ -148,29 +133,21 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     # todo this is where the bug is. this does not correctly set the rhs for the longitude problem
     # refer to EqualAreaParametricMeshNewtonIterator::set_longi_rhs
     values = np.zeros((adjacency.shape[0],))
-    for _, idx, nxt in np.lib.stride_tricks.sliding_window_view(short_path, 3):
-        print(idx)
-        row_idxs, _, _ = sp.find(adjacency[:, [idx]])
-        for row_idx in row_idxs:
-            if row_idx in short_path:
-                # don't alter the path itself
-                continue
 
-            # if current idx is west of the meridian
+    idx = sp.find(adjacency[:, [NORTH]])[0][0]
+    while idx != SOUTH:
+        nbs, _, _ = sp.find(adjacency[:, [idx]])
+        argnext = np.argmax(lat[nbs])
+
+        for nb in nbs:
             # noinspection PyUnreachableCode
-            if (
-                np.dot(
-                    norms[idx],
-                    np.cross(verts[nxt] - verts[idx], verts[row_idx] - verts[idx]),
-                )
-                > 0
-            ):
-                values[row_idx] -= 2 * np.pi
+            if np.dot(norms[idx], np.cross([0, 0, 1], verts[nb] - verts[idx])) < 0:
+                values[nb] -= 2 * np.pi
                 values[idx] += 2 * np.pi
 
-    b = values[1:-1]
-    print(*[f'{e:> 2.2f}' for e in b])
+        idx = nbs[argnext]
 
+    b = values[1:-1]
     x = sp.linalg.spsolve(A, b)
     lon[1:-1] = x
 
@@ -354,5 +331,14 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
     )
     final = result.x.reshape(sphere.shape)
 
-    _ = final
-    # todo reconstruct lat, lon from final; apply to the mesh.
+    sphere = final.T
+    lat = np.acos(sphere[2])
+    lon = np.atan2(sphere[1], sphere[2])
+
+    arr = numpy_support.numpy_to_vtk(lat)
+    arr.SetName("Latitude")
+    mesh.GetPointData().AddArray(arr)
+
+    arr = numpy_support.numpy_to_vtk(lon)
+    arr.SetName("Longitude")
+    mesh.GetPointData().AddArray(arr)
