@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
-import scipy.optimize
+import torch
 import vtk
 from scipy import sparse as sp
-from scipy.optimize import NonlinearConstraint
 from vtkmodules.util import numpy_support
+from vtkmodules.vtkCommonCore import vtkIdList
+from vtkmodules.vtkCommonDataModel import vtkPolyData
 
 
 def neighbors(data: vtk.vtkPolyData, pt: int) -> set:
@@ -159,9 +160,11 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
     return mesh
 
 
-def refine_parameterization(mesh: vtk.vtkPolyData):
-    # edges = build_edges(mesh)
-    # matrix = build_adjacency_matrix(edges)
+def torch_refine_parameterization(
+    mesh: vtkPolyData,
+    maxiter=1000,
+):
+    """Projected Gradient Descent"""
 
     pd: vtk.vtkPointData = mesh.GetPointData()
     lat = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Latitude"))
@@ -172,173 +175,158 @@ def refine_parameterization(mesh: vtk.vtkPolyData):
 
     # cd: vtk.vtkCellData = mesh.GetCellData()
 
-    cells = np.zeros((mesh.GetNumberOfCells(), 4), dtype="i")
-    for idx in range(mesh.GetNumberOfCells()):
-        cell: vtk.vtkCell = mesh.GetCell(idx)
-        ids: vtk.vtkIdList = cell.GetPointIds()
-        cells[idx] = [ids.GetId(k) for k in range(ids.GetNumberOfIds())]
+    # AREA_WEIGHT = 1
+    # ANGLE_WEIGHT = 0
 
-    sphere = np.array(
-        [
-            np.sin(lat) * np.cos(lon),
-            np.sin(lat) * np.sin(lon),
-            np.cos(lat),
-        ]
-    ).T
+    quads = []
+    for cid in range(mesh.GetNumberOfCells()):
+        pts = vtkIdList()
+        mesh.GetCellPoints(cid, pts)
+        quads.append([pts.GetId(k) for k in range(pts.GetNumberOfIds())])
 
-    ideal_cell_area = 4 * np.pi / mesh.GetNumberOfCells()
+    A, B, C, D = np.transpose(quads)
 
-    edge_indices = [[0, 1], [1, 2], [2, 3], [3, 0]]
+    # print(connections)
 
-    angle_det_indices = [
-        [3, 0, 1],
-        [0, 1, 2],
-        [1, 2, 3],
-        [2, 3, 0],
-    ]
+    ideal_cell_area = 4 * torch.pi / mesh.GetNumberOfCells()
 
-    diag_a_indices = [1, 0, 1, 0]
-    diag_b_indices = [3, 2, 3, 2]
+    # cells = np.zeros((mesh.GetNumberOfCells(), 3), dtype="i")
+    # for idx in range(mesh.GetNumberOfCells()):
+    #     cell: vtk.vtkCell = mesh.GetCell(idx)
+    #     ids: vtk.vtkIdList = cell.GetPointIds()
+    #     cells[idx] = [ids.GetId(k) for k in range(ids.GetNumberOfIds())]
 
-    # todo make a class, not closures.
+    # state = torch.tensor(np.array([
+    #     lat,
+    #     lon,
+    # ]), requires_grad=True)
 
-    # todo let `x` be lat/lon, then there is no need for norm constraint. would need to recompute cartesian coordinates
-    #  in goal func and area constraint, so better merge `goal_func` and `gradient` together with `jac=True`.
-    #  https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize.html#scipy.optimize.minimize
+    lat = torch.tensor(lat, requires_grad=True)
+    lon = torch.tensor(lon, requires_grad=True)
 
-    def goal_func(x) -> float:
-        """See EqualAreaParametricMeshNewtonIterator::goal_func."""
-        # for vertex in vertices:
-        #     for neighbor in neighbors(vertex):
-        #         goal += 1 - dot(vertex, neighbor)
+    # sphere = torch.tensor(np.array([
+    #     np.sin(lat) * np.cos(lon),
+    #     np.sin(lat) * np.sin(lon),
+    #     np.cos(lat),
+    # ]), requires_grad=True)
 
-        points = x.reshape(sphere.shape)
+    optimizer = torch.optim.Adam([lat, lon], lr=9e-4)
+    for i in range(maxiter):
+        optimizer.zero_grad()
 
-        prod = np.prod(points[cells[:, edge_indices]], axis=-2).reshape(-1, 3)
+        coords = torch.stack(
+            [
+                torch.sin(lat) * torch.cos(lon),
+                torch.sin(lat) * torch.sin(lon),
+                torch.cos(lat),
+            ]
+        ).T
 
-        return (len(prod) - prod.sum()) / 2
+        _ = i
 
-    def gradient(x) -> np.ndarray:
-        """See EqualAreaParametricMeshNewtonIterator::calc_gradient."""
-        # for vertex in vertices:
-        #     nbsum = [0, 0, 0]
+        A1 = torch.stack([coords[C], coords[B], coords[A]], dim=2).det()
+        A2 = torch.stack([coords[A], coords[D], coords[C]], dim=2).det()
+        areas = (A1 + A2) / 2
+        area_rms_error = (areas - ideal_cell_area).pow(2).sum().sqrt()
+
+        # diagonal = torch.tensordot(coords[A], coords[C], dims=([0], [0]))
+        # diagonal = coords[A].T @ coords[C]
+        AC = (coords[A] * coords[C]).sum(dim=1)
+        BD = (coords[B] * coords[D]).sum(dim=1)
+
+        diagonals = torch.stack([AC, BD])
+        # print(diagonals)
+        diagonals_rms_error = (1 - diagonals).pow(2).sum().sqrt()
+
+        # metric = area_rms_error + diagonals_rms_error
+        metric = diagonals_rms_error + area_rms_error
+
+        # metric = torch.var(areas)
+        # print(metric)
+
+        # print(torch.stack([coords[A], coords[B], coords[C]], dim=1).det().shape)
+        # print(torch.stack([coords[A], coords[B], coords[C]]).shape)
+        # coords[C], coords[D], coords[A],
+        # sys.exit()
+
+        # torch.linalg.det()
+        # delta = torch.norm(coords[U] - coords[V], dim=1)
+
+        # metric = torch.var(delta)
+        # print(metric)
+
+        metric.backward()
+        optimizer.step()
+
+        # corners = sphere.T[cells, :]
+        # areas = torch.linalg.det(corners)
+        # area_error = torch.abs(areas - ideal_cell_area)
         #
-        #     for neighbor in neighbors(vertex):
-        #         nbsum += neighbor
+        # # total_area_error = torch.sum(area_error)  # todo is there a better metric for this?
+        # total_area_error = area_error.norm()
         #
-        #     gradient[vertex] = dot(vertex, nbsum) * vertex - nbsum
+        # l0 = corners[:, 2] - corners[:, 1]
+        # l0 = l0 / l0.norm(dim=1)[:, None]
+        # l1 = corners[:, 2] - corners[:, 0]
+        # l1 = l1 / l1.norm(dim=1)[:, None]
+        # l2 = corners[:, 1] - corners[:, 0]
+        # l2 = l2 / l2.norm(dim=1)[:, None]
+        #
+        # dots = torch.stack(
+        #     [
+        #         l1 * l2,
+        #         -l2 * l0,
+        #         l0 * l1,
+        #     ]
+        # )
+        # angle = torch.acos(dots)
+        #
+        # angle_error = torch.abs(angle - torch.pi / 3)
+        # total_angle_error = angle_error.norm()
+        #
+        # metric = total_area_error * AREA_WEIGHT + total_angle_error * ANGLE_WEIGHT
+        #
+        # metric.backward()
+        #
+        # # print(i, '|||', *(f'{v:0.1f}' for v in area_error), '|||', total_area_error.item())
+        # print(i, "|||", metric.item())
+        #
+        # optimizer.step()
+        #
+        # with torch.no_grad():
+        #     # enforce sphere constraint
+        #     sphere /= sphere.norm(dim=0)
+        #
+        #     # project gradients into tangent space
+        #     sphere.grad -= sphere * (sphere * sphere.grad).sum(dim=0)
 
-        points = x.reshape(sphere.shape)
+    # sphere_f = sphere.detach().numpy()
+    # print(sphere_f[2])
 
-        nbsum = np.zeros_like(points)
-        for u, v in edge_indices:
-            nbsum[cells[:, u]] += points[cells[:, v]]
-            nbsum[cells[:, v]] += points[cells[:, u]]
+    # lat_f = np.arccos(sphere_f[2])
+    # lon_f = np.atan2(sphere_f[1], sphere_f[0])
 
-        dot = (nbsum * points).sum(-1)[:, None]
-        grad = dot * points - nbsum
+    # arr = numpy_support.numpy_to_vtk(lat)
+    # arr.SetName("Latitude_0")
+    # pd.AddArray(arr)
 
-        return grad.ravel()
+    # arr = numpy_support.numpy_to_vtk(lon)
+    # arr.SetName("Longitude_0")
+    # pd.AddArray(arr)
 
-    # def hessian(_):
-    #     """To replace 2-point Hessian in minimize() and reduce gradient count."""
-    #     raise NotImplementedError
-
-    def norms(x) -> np.ndarray:
-        """To constrain norm of each vectors to 1."""
-        points = x.reshape(sphere.shape)
-
-        return np.linalg.norm(points, axis=1)
-
-    def norms_jac(x) -> sp.dok_array:
-        """To constrain norm of each vector to 1."""
-        # Jacobian at any point is normal to the sphere at that point.
-
-        points = x.reshape(sphere.shape)
-        norm = np.linalg.norm(points, axis=1)
-        normalized = points / norm[:, None]
-
-        idxs = np.arange(len(points))
-
-        res = sp.dok_array((len(points), len(x)))
-        for k in range(points.shape[1]):
-            res[idxs, points.shape[1] * idxs + k] = normalized[:, k]
-
-        return res
-
-    # def norms_hess(_):
-    #     """To replace 2-point Hessian in NonlinearConstraint and reduce norms_jac count."""
-    #     raise NotImplementedError
-
-    def areas(x) -> np.ndarray:
-        """See EqualAreaParametricMeshNewtonIterator::spher_area4."""
-        points = x.reshape(sphere.shape)
-
-        corners = points[cells, :]
-
-        diag_a = corners[:, diag_a_indices]
-        diag_b = corners[:, diag_b_indices]
-        dots = (diag_a * diag_b).sum(-1) - (diag_a * corners).sum(-1) * (
-            diag_b * corners
-        ).sum(-1)
-
-        spats = np.linalg.det(corners[:, angle_det_indices])
-
-        areas = -np.arctan2(dots, spats).sum(-1)
-        areas = np.fmod(areas + 8.5 * np.pi, np.pi) - 0.5 * np.pi
-
-        return areas  # noqa: RET504
-
-    # def areas_jac(_) -> np.ndarray:
-    #     """
-    #     To allow sparse Jacobian and 2-point Hessian in NonlinearConstraint.
-    #
-    #     EqualAreaParametricMeshNewtonIterator must compute it somehow...
-    #     """
-    #     raise NotImplementedError
-
-    # def areas_hess(_) -> np.ndarray:
-    #     """To replace 2-point Hessian in NonlinearConstraint and reduce areas_jac count."""
-    #     raise NotImplementedError
-
-    result = scipy.optimize.minimize(
-        fun=goal_func,
-        x0=sphere.ravel(),
-        jac=gradient,
-        hess="2-point",
-        constraints=[
-            NonlinearConstraint(
-                norms,
-                1,
-                1,
-                jac=norms_jac,
-                hess="2-point",
-            ),
-            NonlinearConstraint(
-                areas,
-                ideal_cell_area,
-                ideal_cell_area,
-                # jac=areas_jac,
-                # hess='2-point',
-            ),
-        ],
-        method="trust-constr",
-        options={
-            "xtol": 1e-3,
-            "verbose": 2,
-            "sparse_jacobian": True,
-        },
-    )
-    final = result.x.reshape(sphere.shape)
-
-    sphere = final.T
-    lat = np.acos(sphere[2])
-    lon = np.atan2(sphere[1], sphere[2])
-
-    arr = numpy_support.numpy_to_vtk(lat)
+    arr = numpy_support.numpy_to_vtk(lat.detach())
     arr.SetName("Latitude")
-    mesh.GetPointData().AddArray(arr)
+    pd.AddArray(arr)
 
-    arr = numpy_support.numpy_to_vtk(lon)
+    arr = numpy_support.numpy_to_vtk(lon.detach())
     arr.SetName("Longitude")
-    mesh.GetPointData().AddArray(arr)
+    pd.AddArray(arr)
+
+
+def fit_spharms(mesh: vtk.vtkPolyData):
+    pd: vtk.vtkPointData = mesh.GetPointData()
+
+    lat = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Latitude"))
+    lon = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Longitude"))
+
+    _ = lat, lon
