@@ -67,7 +67,7 @@ def build_mesh(data: vtk.vtkImageData) -> vtk.vtkPolyData:
 
     normals = vtk.vtkPolyDataNormals()
     normals.SetInputConnection(net.GetOutputPort())
-    normals.ComputeCellNormalsOff()
+    normals.ComputeCellNormalsOn()
     normals.ComputePointNormalsOn()
     normals.SplittingOff()
     normals.ConsistencyOn()
@@ -162,21 +162,15 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
 
 def torch_refine_parameterization(
     mesh: vtkPolyData,
-    maxiter=1000,
+    maxiter=2500,
 ):
     """Projected Gradient Descent"""
+
+    edge_mesh = build_edges(mesh)
 
     pd: vtk.vtkPointData = mesh.GetPointData()
     lat = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Latitude"))
     lon = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Longitude"))
-
-    # todo instead of EDGES, maybe get tuples from sparse adjacency matrix?
-    #  maybe some multiplication by the adjacency matrix?
-
-    # cd: vtk.vtkCellData = mesh.GetCellData()
-
-    # AREA_WEIGHT = 1
-    # ANGLE_WEIGHT = 0
 
     quads = []
     for cid in range(mesh.GetNumberOfCells()):
@@ -184,33 +178,22 @@ def torch_refine_parameterization(
         mesh.GetCellPoints(cid, pts)
         quads.append([pts.GetId(k) for k in range(pts.GetNumberOfIds())])
 
+    edges = []
+    for cid in range(edge_mesh.GetNumberOfCells()):
+        pts = vtkIdList()
+        edge_mesh.GetCellPoints(cid, pts)
+        edges.append([pts.GetId(k) for k in range(pts.GetNumberOfIds())])
+
     A, B, C, D = np.transpose(quads)
 
-    # print(connections)
+    U, V = np.transpose(edges)
 
-    ideal_cell_area = 4 * torch.pi / mesh.GetNumberOfCells()
-
-    # cells = np.zeros((mesh.GetNumberOfCells(), 3), dtype="i")
-    # for idx in range(mesh.GetNumberOfCells()):
-    #     cell: vtk.vtkCell = mesh.GetCell(idx)
-    #     ids: vtk.vtkIdList = cell.GetPointIds()
-    #     cells[idx] = [ids.GetId(k) for k in range(ids.GetNumberOfIds())]
-
-    # state = torch.tensor(np.array([
-    #     lat,
-    #     lon,
-    # ]), requires_grad=True)
+    ideal_cell_area = 4 / 3 * torch.pi / mesh.GetNumberOfCells()
 
     lat = torch.tensor(lat, requires_grad=True)
     lon = torch.tensor(lon, requires_grad=True)
 
-    # sphere = torch.tensor(np.array([
-    #     np.sin(lat) * np.cos(lon),
-    #     np.sin(lat) * np.sin(lon),
-    #     np.cos(lat),
-    # ]), requires_grad=True)
-
-    optimizer = torch.optim.Adam([lat, lon], lr=9e-4)
+    optimizer = torch.optim.Adam([lat, lon], lr=1e-2)
     for i in range(maxiter):
         optimizer.zero_grad()
 
@@ -224,95 +207,81 @@ def torch_refine_parameterization(
 
         _ = i
 
-        A1 = torch.stack([coords[C], coords[B], coords[A]], dim=2).det()
-        A2 = torch.stack([coords[A], coords[D], coords[C]], dim=2).det()
-        areas = (A1 + A2) / 2
-        area_rms_error = (areas - ideal_cell_area).pow(2).sum().sqrt()
+        a = coords[A]
+        b = coords[B]
+        c = coords[C]
+        d = coords[D]
 
-        # diagonal = torch.tensordot(coords[A], coords[C], dims=([0], [0]))
-        # diagonal = coords[A].T @ coords[C]
-        AC = (coords[A] * coords[C]).sum(dim=1)
-        BD = (coords[B] * coords[D]).sum(dim=1)
+        ab = torch.linalg.vecdot(a, b, dim=1)
+        ac = torch.linalg.vecdot(a, c, dim=1)
+        ad = torch.linalg.vecdot(a, d, dim=1)
+        bc = torch.linalg.vecdot(b, c, dim=1)
+        bd = torch.linalg.vecdot(b, d, dim=1)
+        cd = torch.linalg.vecdot(c, d, dim=1)
 
-        diagonals = torch.stack([AC, BD])
-        # print(diagonals)
-        diagonals_rms_error = (1 - diagonals).pow(2).sum().sqrt()
+        Ca = bd - ad * ab
+        Cb = ac - ab * bc
+        Cc = bd - bc * cd
+        Cd = ac - cd * ad
 
-        # metric = area_rms_error + diagonals_rms_error
-        metric = diagonals_rms_error + area_rms_error
+        spata = torch.stack([d, a, b], dim=2).det()
+        spatb = torch.stack([a, b, c], dim=2).det()
+        spatc = torch.stack([b, c, d], dim=2).det()
+        spatd = torch.stack([c, d, a], dim=2).det()
 
-        # metric = torch.var(areas)
-        # print(metric)
+        area = -(
+            torch.atan2(Ca, spata)
+            + torch.atan2(Cb, spatb)
+            + torch.atan2(Cc, spatc)
+            + torch.atan2(Cd, spatd)
+        )
+        areas = torch.fmod(area + 8.5 * torch.pi, torch.pi) - 0.5 * torch.pi
 
-        # print(torch.stack([coords[A], coords[B], coords[C]], dim=1).det().shape)
-        # print(torch.stack([coords[A], coords[B], coords[C]]).shape)
-        # coords[C], coords[D], coords[A],
-        # sys.exit()
+        AREA_POW = 2
+        AREA_FACTOR = 50
+        area_error = (
+            ((areas.abs() - ideal_cell_area) * AREA_FACTOR)
+            .pow(AREA_POW)
+            .sum()
+            .pow(1 / AREA_POW)
+        )
 
-        # torch.linalg.det()
-        # delta = torch.norm(coords[U] - coords[V], dim=1)
+        crossings = -torch.stack(
+            [
+                torch.linalg.vecdot(a - b, c - d, dim=1),  # should be -1
+                torch.linalg.vecdot(b - c, d - a, dim=1),  # should be -1
+            ]
+        )
+        crossings[crossings < 0] *= 10
+        crossings_error = (1 - crossings).pow(2).sum().pow(1 / 2)
 
-        # metric = torch.var(delta)
-        # print(metric)
+        u = coords[U]
+        v = coords[V]
+
+        goal = (1 - (u * v).sum(dim=1)).sum() / 2
+
+        metric = area_error + crossings_error + goal
 
         metric.backward()
         optimizer.step()
 
-        # corners = sphere.T[cells, :]
-        # areas = torch.linalg.det(corners)
-        # area_error = torch.abs(areas - ideal_cell_area)
-        #
-        # # total_area_error = torch.sum(area_error)  # todo is there a better metric for this?
-        # total_area_error = area_error.norm()
-        #
-        # l0 = corners[:, 2] - corners[:, 1]
-        # l0 = l0 / l0.norm(dim=1)[:, None]
-        # l1 = corners[:, 2] - corners[:, 0]
-        # l1 = l1 / l1.norm(dim=1)[:, None]
-        # l2 = corners[:, 1] - corners[:, 0]
-        # l2 = l2 / l2.norm(dim=1)[:, None]
-        #
-        # dots = torch.stack(
-        #     [
-        #         l1 * l2,
-        #         -l2 * l0,
-        #         l0 * l1,
-        #     ]
-        # )
-        # angle = torch.acos(dots)
-        #
-        # angle_error = torch.abs(angle - torch.pi / 3)
-        # total_angle_error = angle_error.norm()
-        #
-        # metric = total_area_error * AREA_WEIGHT + total_angle_error * ANGLE_WEIGHT
-        #
-        # metric.backward()
-        #
-        # # print(i, '|||', *(f'{v:0.1f}' for v in area_error), '|||', total_area_error.item())
-        # print(i, "|||", metric.item())
-        #
-        # optimizer.step()
-        #
+        arr = numpy_support.numpy_to_vtk(lat.detach())
+        arr.SetName("Latitude")
+        pd.AddArray(arr)
+
+        arr = numpy_support.numpy_to_vtk(lon.detach())
+        arr.SetName("Longitude")
+        pd.AddArray(arr)
+
+        if i % 50 == 0:
+            yield i, mesh
+
         # with torch.no_grad():
         #     # enforce sphere constraint
         #     sphere /= sphere.norm(dim=0)
         #
         #     # project gradients into tangent space
         #     sphere.grad -= sphere * (sphere * sphere.grad).sum(dim=0)
-
-    # sphere_f = sphere.detach().numpy()
-    # print(sphere_f[2])
-
-    # lat_f = np.arccos(sphere_f[2])
-    # lon_f = np.atan2(sphere_f[1], sphere_f[0])
-
-    # arr = numpy_support.numpy_to_vtk(lat)
-    # arr.SetName("Latitude_0")
-    # pd.AddArray(arr)
-
-    # arr = numpy_support.numpy_to_vtk(lon)
-    # arr.SetName("Longitude_0")
-    # pd.AddArray(arr)
 
     arr = numpy_support.numpy_to_vtk(lat.detach())
     arr.SetName("Latitude")
