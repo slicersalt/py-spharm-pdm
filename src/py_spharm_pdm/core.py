@@ -188,7 +188,7 @@ def torch_refine_parameterization(
 
     U, V = np.transpose(edges)
 
-    ideal_cell_area = 4 / 3 * torch.pi / mesh.GetNumberOfCells()
+    ideal_cell_area = 4 * torch.pi / mesh.GetNumberOfCells()
 
     lat = torch.tensor(lat, requires_grad=True)
     lon = torch.tensor(lon, requires_grad=True)
