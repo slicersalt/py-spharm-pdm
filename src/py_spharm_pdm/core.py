@@ -162,7 +162,7 @@ def initial_parameterization(data: vtk.vtkImageData) -> vtk.vtkPolyData:
 
 def torch_refine_parameterization(
     mesh: vtkPolyData,
-    maxiter=3500,
+    maxiter=2500,
 ):
     """Projected Gradient Descent"""
 
@@ -193,20 +193,6 @@ def torch_refine_parameterization(
     lat = torch.tensor(lat, requires_grad=True)
     lon = torch.tensor(lon, requires_grad=True)
 
-    def ang(a, b, c):
-        ab = torch.linalg.vecdot(a, b, dim=1)
-        cb = torch.linalg.vecdot(c, b, dim=1)
-
-        a_ = a - (b.T * ab).T
-        c_ = c - (b.T * cb).T
-
-        a_n = torch.linalg.norm(a_, dim=1)
-        c_n = torch.linalg.norm(c_, dim=1)
-
-        sin = (torch.linalg.cross(a_, c_, dim=1).T / (a_n * c_n)).T
-
-        return torch.asin(sin)
-
     optimizer = torch.optim.Adam([lat, lon], lr=1e-2)
     for i in range(maxiter):
         optimizer.zero_grad()
@@ -226,41 +212,35 @@ def torch_refine_parameterization(
         c = coords[C]
         d = coords[D]
 
-        # Todhunter Formula
+        ab = torch.linalg.vecdot(a, b, dim=1)
+        ac = torch.linalg.vecdot(a, c, dim=1)
+        ad = torch.linalg.vecdot(a, d, dim=1)
+        bc = torch.linalg.vecdot(b, c, dim=1)
+        bd = torch.linalg.vecdot(b, d, dim=1)
+        cd = torch.linalg.vecdot(c, d, dim=1)
 
-        areas = (ang(a, b, c) + ang(b, c, d) + ang(c, d, a) + ang(d, a, b)) - (
-            (4 - 2) * torch.pi
+        Ca = bd - ad * ab
+        Cb = ac - ab * bc
+        Cc = bd - bc * cd
+        Cd = ac - cd * ad
+
+        spata = torch.stack([d, a, b], dim=2).det()
+        spatb = torch.stack([a, b, c], dim=2).det()
+        spatc = torch.stack([b, c, d], dim=2).det()
+        spatd = torch.stack([c, d, a], dim=2).det()
+
+        area = -(
+            torch.atan2(Ca, spata)
+            + torch.atan2(Cb, spatb)
+            + torch.atan2(Cc, spatc)
+            + torch.atan2(Cd, spatd)
         )
-
-        # ab = torch.linalg.vecdot(a, b, dim=1)
-        # ac = torch.linalg.vecdot(a, c, dim=1)
-        # ad = torch.linalg.vecdot(a, d, dim=1)
-        # bc = torch.linalg.vecdot(b, c, dim=1)
-        # bd = torch.linalg.vecdot(b, d, dim=1)
-        # cd = torch.linalg.vecdot(c, d, dim=1)
-        #
-        # Ca = bd - ad * ab
-        # Cb = ac - ab * bc
-        # Cc = bd - bc * cd
-        # Cd = ac - cd * ad
-        #
-        # spata = torch.stack([d, a, b], dim=2).det()
-        # spatb = torch.stack([a, b, c], dim=2).det()
-        # spatc = torch.stack([b, c, d], dim=2).det()
-        # spatd = torch.stack([c, d, a], dim=2).det()
-        #
-        # area = -(
-        #     torch.atan2(Ca, spata)
-        #     + torch.atan2(Cb, spatb)
-        #     + torch.atan2(Cc, spatc)
-        #     + torch.atan2(Cd, spatd)
-        # )
-        # areas = torch.fmod(area + 8.5 * torch.pi, torch.pi) - 0.5 * torch.pi
+        areas = torch.fmod(area + 8.5 * torch.pi, torch.pi) - 0.5 * torch.pi
 
         AREA_POW = 2
-        AREA_FACTOR = 500
+        AREA_FACTOR = 50
         area_error = (
-            ((areas - ideal_cell_area) * AREA_FACTOR)
+            ((areas.abs() - ideal_cell_area) * AREA_FACTOR)
             .pow(AREA_POW)
             .sum()
             .pow(1 / AREA_POW)
