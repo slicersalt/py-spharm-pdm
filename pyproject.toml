@@ -34,6 +34,7 @@ dependencies = [
   "numpy>=1.26", # current Slicer version
   "scipy>=1.11.3", # requires sparse laplacian support
   "vtk>=9.2", # current Slicer version
+  "torch~=2.4", # current SlicerPyTorch version
 ]
 
 [project.optional-dependencies]
