@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import vtk
 from scipy import sparse as sp
+from scipy.special import sph_harm
+from vtkmodules.numpy_interface.dataset_adapter import PolyData
 from vtkmodules.util import numpy_support
 from vtkmodules.vtkCommonCore import vtkIdList
 from vtkmodules.vtkCommonDataModel import vtkPolyData
@@ -292,10 +294,68 @@ def torch_refine_parameterization(
     pd.AddArray(arr)
 
 
-def fit_spharms(mesh: vtk.vtkPolyData):
-    pd: vtk.vtkPointData = mesh.GetPointData()
+def fit_spharms(mesh: vtk.vtkPolyData, degree: int) -> np.ndarray:
+    mesh: PolyData = PolyData(mesh)
 
-    lat = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Latitude"))
-    lon = numpy_support.vtk_to_numpy(pd.GetAbstractArray("Longitude"))
+    theta = mesh.PointData['Longitude']
+    phi = mesh.PointData['Latitude']
 
-    _ = lat, lon
+    A = np.array([
+        sph_harm(m, n, theta, phi)
+        for n in range(degree)
+        for m in range(-n, n + 1)
+    ]).T
+
+    coefs = np.linalg.solve(A.T @ A, A.T @ mesh.Points)
+
+    return coefs
+
+
+def resample_spharms(mesh: vtk.vtkPolyData, coefs: np.ndarray):
+    """Updates mesh in-place"""
+
+    degree = int(np.sqrt(len(coefs)))
+    assert len(coefs) == degree ** 2
+
+    mesh: PolyData = PolyData(mesh)
+
+    theta = mesh.PointData['Longitude']
+    phi = mesh.PointData['Latitude']
+
+    A = np.array([
+        sph_harm(m, n, theta, phi)
+        for n in range(degree)
+        for m in range(-n, n + 1)
+    ]).T
+
+    xyz = A @ coefs
+
+    mesh.SetPoints(xyz.real)
+
+
+def icosahedron(subdivisions: int = 4) -> vtkPolyData:
+    src = vtk.vtkPlatonicSolidSource()
+    src.SetSolidTypeToIcosahedron()
+    sub = vtk.vtkLinearSubdivisionFilter()
+    sub.SetInputConnection(src.GetOutputPort())
+    sub.SetNumberOfSubdivisions(subdivisions)
+    sub.Update()
+
+    mesh: vtkPolyData = sub.GetOutput()
+
+    x, y, z = PolyData(mesh).Points.T
+
+    theta, phi = np.array([
+        np.atan2(y, z),
+        np.acos(x),
+    ])
+
+    arr = numpy_support.numpy_to_vtk(theta)
+    arr.SetName('Longitude')
+    mesh.GetPointData().AddArray(arr)
+
+    arr = numpy_support.numpy_to_vtk(phi)
+    arr.SetName('Latitude')
+    mesh.GetPointData().AddArray(arr)
+
+    return mesh
